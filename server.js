@@ -1,12 +1,11 @@
 ﻿const express = require("express");
-const fetch = require("node-fetch");
 const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Test route to confirm server works
+// Test root route
 app.get("/", (req, res) => {
-  res.send({ ok: true, message: "Backend is running!" });
+  res.json({ ok: true, message: "Backend is running!" });
 });
 
 // ✅ Migrated endpoint
@@ -20,8 +19,12 @@ app.get("/api/migrated", async (req, res) => {
   try {
     const url = `https://api.dexscreener.com/latest/dex/pairs/solana/${mint}`;
     const response = await fetch(url);
-    const data = await response.json();
 
+    if (!response.ok) {
+      return res.status(502).json({ ok: false, error: "Upstream error", status: response.status });
+    }
+
+    const data = await response.json();
     res.json({ ok: true, data });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
