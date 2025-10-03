@@ -1,144 +1,107 @@
 // src/server.js
 import express from "express";
+import fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// simple CORS for dev
+// Allow all CORS (for testing)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
 });
 
-// --- cache + inflight support to avoid hammering Dexscreener ---
-const CACHE_TTL_MS = 15_000; // 15 seconds
+const TTL = 60_000; // 60s cache
 let cache = { pairs: null, ts: 0 };
-let inflightFetchPromise = null;
-
-async function fetchPairsFromDex() {
-  const url = "https://api.dexscreener.com/latest/dex/search?q=solana";
-  const resp = await fetch(url, { headers: { Accept: "application/json" } });
-  const text = await resp.text().catch(() => null);
-
-  if (!resp.ok) {
-    // return full text preview for logs & error messages
-    const preview = text ? text.slice(0, 1000) : "";
-    const err = new Error(`Dexscreener ${resp.status} - ${preview}`);
-    err.status = resp.status;
-    throw err;
-  }
-
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch (e) {
-    throw new Error("Dexscreener returned non-JSON");
-  }
-
-  // normalize: expect json.pairs array
-  return Array.isArray(json.pairs) ? json.pairs : [];
-}
 
 async function fetchPairs() {
   const now = Date.now();
-  if (cache.pairs && now - cache.ts < CACHE_TTL_MS) return cache.pairs;
+  if (cache.pairs && now - cache.ts < TTL) return cache.pairs;
 
-  // if a fetch is already in progress, wait for it
-  if (inflightFetchPromise) {
-    try { return await inflightFetchPromise; }
-    finally { /* return to caller */ }
-  }
+  try {
+    const url = "https://api.dexscreener.com/latest/dex/search?q=solana";
+    const resp = await fetch(url, { headers: { Accept: "application/json" } });
 
-  inflightFetchPromise = (async () => {
+    if (!resp.ok) throw new Error("Dexscreener " + resp.status);
+    const json = await resp.json();
+
+    cache = { pairs: json.pairs || [], ts: Date.now() };
+    return cache.pairs;
+  } catch (err) {
+    console.warn("Dexscreener failed, serving fallback:", err.message);
     try {
-      const pairs = await fetchPairsFromDex();
-      cache = { pairs, ts: Date.now() };
-      return pairs;
-    } catch (err) {
-      // if DexScreener rate-limited (429) or otherwise failed and we have cached data, return cache
-      if (cache.pairs && cache.pairs.length > 0) {
-        console.warn("fetchPairs: upstream failed, returning cached pairs:", err.message);
-        return cache.pairs;
-      }
-      // no cache — rethrow so callers can return proper 503/429
-      throw err;
-    } finally {
-      inflightFetchPromise = null;
+      const raw = fs.readFileSync("./fallback.json", "utf8");
+      const parsed = JSON.parse(raw);
+      return parsed.pairs || [];
+    } catch (e) {
+      console.error("No fallback.json found or invalid:", e.message);
+      return [];
     }
-  })();
-
-  return await inflightFetchPromise;
+  }
 }
 
-// --- helpers to build each view ---
+function pickRandom(arr, n = 10) {
+  const shuffled = arr.sort(() => 0.5 - Math.random());
+  return shuffled.slice(0, n);
+}
+
+// Filters
 function filterNewPairs(pairs) {
-  return pairs.filter(p => p.dexId === "pumpfun");
+  return pairs.filter(p => p.dexId === "pumpfun" && Number(p.fdv ?? 0) < 10000);
 }
 function filterFinalStretch(pairs) {
-  return pairs.filter(p => {
-    if (p.dexId !== "pumpfun") return false;
-    const fdv = Number(p.fdv ?? p.fdvUsd ?? p.marketCap ?? 0);
-    return fdv >= 15000;
-  });
+  return pairs.filter(p => p.dexId === "pumpfun" && Number(p.fdv ?? 0) < 80000);
 }
 function filterMigrated(pairs) {
-  return pairs.filter(p => p.dexId === "raydium");
+  return pairs.filter(p => p.dexId === "raydium" && Number(p.fdv ?? 0) < 80000);
 }
 
-// --- routes ---
+// Routes
 app.get("/", (req, res) => res.json({ ok: true, message: "Backend is running!" }));
 
 app.get("/api/new-pairs", async (req, res) => {
   try {
     const pairs = await fetchPairs();
-    const coins = filterNewPairs(pairs);
+    const coins = pickRandom(filterNewPairs(pairs), 10);
     res.json({ ok: true, count: coins.length, coins });
   } catch (err) {
-    console.error("ERR /api/new-pairs:", err.message || err);
-    const status = err.status === 429 ? 429 : 503;
-    res.status(status).json({ ok: false, error: err.message });
+    res.status(503).json({ ok: false, error: err.message });
   }
 });
 
 app.get("/api/final-stretch", async (req, res) => {
   try {
     const pairs = await fetchPairs();
-    const coins = filterFinalStretch(pairs);
+    const coins = pickRandom(filterFinalStretch(pairs), 10);
     res.json({ ok: true, count: coins.length, coins });
   } catch (err) {
-    console.error("ERR /api/final-stretch:", err.message || err);
-    const status = err.status === 429 ? 429 : 503;
-    res.status(status).json({ ok: false, error: err.message });
+    res.status(503).json({ ok: false, error: err.message });
   }
 });
 
 app.get("/api/migrated", async (req, res) => {
   try {
     const pairs = await fetchPairs();
-    const coins = filterMigrated(pairs);
+    const coins = pickRandom(filterMigrated(pairs), 10);
     res.json({ ok: true, count: coins.length, coins });
   } catch (err) {
-    console.error("ERR /api/migrated:", err.message || err);
-    const status = err.status === 429 ? 429 : 503;
-    res.status(status).json({ ok: false, error: err.message });
+    res.status(503).json({ ok: false, error: err.message });
   }
 });
 
-// convenience aggregated endpoint the frontend can use (optional)
+// Aggregate route
 app.get("/api/pulse", async (req, res) => {
   try {
     const pairs = await fetchPairs();
     res.json({
       ok: true,
-      timestamp: new Date().toISOString(),
-      newPairs: filterNewPairs(pairs),
-      finalStretch: filterFinalStretch(pairs),
-      migrated: filterMigrated(pairs),
+      ts: new Date().toISOString(),
+      newPairs: pickRandom(filterNewPairs(pairs), 10),
+      finalStretch: pickRandom(filterFinalStretch(pairs), 10),
+      migrated: pickRandom(filterMigrated(pairs), 10),
     });
   } catch (err) {
-    console.error("ERR /api/pulse:", err.message || err);
-    const status = err.status === 429 ? 429 : 503;
-    res.status(status).json({ ok: false, error: err.message });
+    res.status(503).json({ ok: false, error: err.message });
   }
 });
 
