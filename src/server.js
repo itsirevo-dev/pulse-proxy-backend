@@ -1,58 +1,85 @@
 // src/server.js
 import express from "express";
-
+import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Allow CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
 });
 
-// Fetch Solana trending pools from GeckoTerminal
+// Cache
+const TTL = 60_000;
+let cache = { data: null, ts: 0 };
+
+// Format market cap
+function formatNumber(num) {
+  if (!num) return "N/A";
+  if (num >= 1_000_000_000) return (num / 1_000_000_000).toFixed(1) + "B";
+  if (num >= 1_000_000) return (num / 1_000_000).toFixed(1) + "M";
+  if (num >= 1_000) return (num / 1_000).toFixed(1) + "K";
+  return num.toString();
+}
+
+// Format relative time
+function timeAgo(ts) {
+  if (!ts) return "Unknown";
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+// Transform token data
+function transformToken(p) {
+  return {
+    symbol: p.baseToken?.symbol || "N/A",
+    name: p.baseToken?.name || "Unknown Token",
+    logo: p.info?.imageUrl || null,
+    priceUsd: p.priceUsd ? `$${Number(p.priceUsd).toFixed(6)}` : "N/A",
+    marketCap: formatNumber(p.marketCap),
+    url: p.url,
+    age: timeAgo(p.pairCreatedAt)
+  };
+}
+
+// Fetch Solana tokens
 async function fetchSolanaTokens() {
+  const now = Date.now();
+  if (cache.data && now - cache.ts < TTL) return cache.data;
+
+  const url = "https://api.geckoterminal.com/api/v2/networks/solana/pools";
   try {
-    const url = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools";
-    const resp = await fetch(url, { headers: { Accept: "application/json" } });
-
-    if (!resp.ok) throw new Error(`GeckoTerminal ${resp.status}`);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("GeckoTerminal " + resp.status);
     const json = await resp.json();
+    const pools = json.data || [];
 
-    if (!json.data) return [];
-    return json.data.map((pool) => ({
-      id: pool.id,
-      address: pool.attributes?.address,
-      baseToken: pool.attributes?.base_token?.name,
-      symbol: pool.attributes?.base_token?.symbol,
-      priceUsd: pool.attributes?.price_usd,
-      fdv: pool.attributes?.fdv_usd,
-      marketCap: pool.attributes?.market_cap_usd,
-      createdAt: pool.attributes?.pool_created_at,
+    const tokens = pools.map(p => ({
+      baseToken: {
+        symbol: p.attributes?.token_symbol,
+        name: p.attributes?.token_name
+      },
+      info: { imageUrl: p.attributes?.token_logo_url },
+      priceUsd: p.attributes?.price_in_usd,
+      marketCap: p.attributes?.market_cap_usd,
+      url: `https://www.geckoterminal.com/solana/pools/${p.id}`,
+      pairCreatedAt: Date.parse(p.attributes?.created_at)
     }));
+
+    cache = { data: tokens, ts: Date.now() };
+    return tokens;
   } catch (err) {
     console.error("fetchSolanaTokens failed:", err.message);
     return [];
   }
-}
-
-// Pick random
-function pickRandom(arr, n) {
-  if (!arr.length) return [];
-  const shuffled = [...arr].sort(() => 0.5 - Math.random());
-  return shuffled.slice(0, n);
-}
-
-// Ensure always 15
-function ensure15(arr, allTokens) {
-  const selected = pickRandom(arr, 15);
-  while (selected.length < 15 && allTokens.length > 0) {
-    const candidate = pickRandom(allTokens, 1)[0];
-    if (!selected.find((t) => t.id === candidate.id)) {
-      selected.push(candidate);
-    }
-  }
-  return selected;
 }
 
 // Routes
@@ -61,24 +88,17 @@ app.get("/", (req, res) => res.json({ ok: true, message: "Backend is running!" }
 app.get("/api/pulse", async (req, res) => {
   try {
     const tokens = await fetchSolanaTokens();
-    if (!tokens.length) {
-      return res.json({ ok: true, ts: new Date().toISOString(), newPairs: [], finalStretch: [], migrated: [] });
-    }
-
-    const newPairs = ensure15(tokens, tokens);
-    const finalStretch = ensure15(tokens, tokens);
-    const migrated = ensure15(tokens, tokens);
-
     res.json({
       ok: true,
       ts: new Date().toISOString(),
-      newPairs,
-      finalStretch,
-      migrated,
+      newPairs: tokens.slice(0, 15).map(transformToken),
+      finalStretch: tokens.slice(15, 30).map(transformToken),
+      migrated: tokens.slice(30, 45).map(transformToken),
     });
   } catch (err) {
     res.status(503).json({ ok: false, error: err.message });
   }
 });
 
+// Start
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
